@@ -44,6 +44,14 @@ IOVI separates data publication from semantic verification.
 
 This repo is the verifier side of that flow. It does not sign transactions, relay transactions, hold wallets, or custody private material.
 
+The current reference implementation verifies one semantic layer at a time because that is the smallest useful proof. A production verifier should usually support many semantic layers. In that model, the verifier keeps a registry keyed by `slId`:
+
+- `slId -> Semantic Layer Manifest`
+- `slId -> current state and checkpoint`
+- `slId -> receipts`
+
+When a payload arrives, the verifier decodes the `slId`, loads the matching manifest, applies that layer's transition rule, and emits a receipt scoped to that semantic layer.
+
 ## First Verification
 
 This example creates a manifest, generates a realistic SLDK payload, verifies it, and prints the receipt verdict. It expects both `github:bryfeng/iovi-reference-verifier` and `@bryaniovi/sldk` to be installed.
@@ -163,7 +171,9 @@ Routes:
 
 ### Semantic Layer Manifest
 
-A Semantic Layer Manifest tells clients how one semantic layer is published, verified, and checkpointed.
+A Semantic Layer Manifest is the public contract for one semantic layer. It is not the verifier's global config.
+
+The manifest tells clients and verifiers how that semantic layer is published, verified, and checkpointed.
 
 It includes:
 
@@ -175,6 +185,34 @@ It includes:
 - `checkpointPolicy`: how many verifier receipts are required
 
 The current schema version is represented in code by `SemanticLayerManifestV1`.
+
+### Publishing a Manifest
+
+For local development, you can pass the manifest directly into `new IoviReferenceVerifier({ manifest })`.
+
+For public or multi-party use, the semantic layer should publish its manifest somewhere clients and verifiers can resolve it. The practical progression is:
+
+- Start with signed JSON at a stable HTTPS URL.
+- Include the manifest URL and manifest hash in app docs, verifier config, or semantic-layer metadata.
+- Later, publish a compact manifest pointer on EON with `slId`, URL, version, hash, and publisher signature.
+- A directory semantic layer or registry API can index those pointers so clients can discover semantic layers and verifier endpoints.
+
+The manifest itself does not have to be large or fully on-chain. The important property is that clients can identify the exact manifest they are trusting, and verifiers can prove which manifest they used when producing a receipt.
+
+### Is a Manifest Required?
+
+Not for every toy or closed integration. A single app can hardcode `slId`, codec, transition rules, and verifier endpoint.
+
+For an open semantic-layer ecosystem, a manifest becomes important because it gives independent developers a shared contract:
+
+- how to encode payloads
+- where to publish them
+- which verifier endpoints are expected
+- which receipt format is valid
+- which transition function governs acceptance
+- which checkpoint policy clients should trust
+
+So the manifest is not the thing that makes verification mathematically possible. It is the thing that makes verification discoverable, portable, and composable across teams.
 
 ### Verifier Receipt
 
@@ -211,6 +249,7 @@ The SLDK should help generate stable operation ids. APIs still need to enforce i
 This is a reference implementation, not a production verifier network.
 
 - State is in memory.
+- One `IoviReferenceVerifier` instance handles one semantic layer at a time.
 - Receipt signatures are deterministic reference signatures, not production key signatures.
 - There is no indexed base-layer event feed yet.
 - The built-in transition function checks ordering and state-root continuity, but it does not execute arbitrary application logic yet.
