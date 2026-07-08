@@ -36,6 +36,12 @@ Node 22 or newer is expected.
 
 The package is source-first for now. Runtime verifier code is self-contained. Tests use `@bryaniovi/sldk` to generate realistic SLDK payloads.
 
+You can also install the current GitHub build into another Node project:
+
+```bash
+npm install github:bryfeng/iovi-reference-verifier
+```
+
 ## Core Concepts
 
 ### SemanticLayerManifestV1
