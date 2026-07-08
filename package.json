@@ -1,0 +1,33 @@
+{
+  "name": "@bryaniovi/iovi-reference-verifier",
+  "version": "0.1.0-alpha.0",
+  "type": "module",
+  "private": true,
+  "description": "Standalone IOVI Reference Verifier proof around SemanticLayerManifestV1 and VerifierReceiptV1.",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "prepare": "npm run build",
+    "test": "npm run build && node --test tests/*.test.mjs",
+    "check": "npm run test"
+  },
+  "devDependencies": {
+    "@bryaniovi/sldk": "0.1.0-alpha.3",
+    "@types/node": "^25.6.2",
+    "typescript": "^6.0.3"
+  }
+}
