@@ -1,29 +1,17 @@
 # IOVI Reference Verifier
 
-The IOVI Reference Verifier is a standalone V2 verifier proof for semantic-layer payloads posted through the IOVI SLDK flow.
+Run a local verifier for IOVI semantic-layer payloads.
 
-It is designed to be a neutral verification service that any client can query. The playground can use it as one verifier source, but the verifier is not owned by the playground and does not depend on playground state.
+The Reference Verifier checks that an encoded semantic-layer payload belongs to the expected semantic layer, follows the next valid sequence number, and continues from the previous accepted state root. It returns a Verifier Receipt that your app can store, display, or pass to another system as evidence of the verifier's decision.
 
-## What It Does
+Use this repo when you want to:
 
-- accepts a `SemanticLayerManifestV1`
-- decodes IOVI SLDK semantic-layer payloads from `payloadHex` or EON `Data` scalars
-- checks semantic-layer id, sequence, and previous-state hash
-- advances a local checkpoint when a payload is accepted
-- emits `VerifierReceiptV1` receipts for accepted and rejected payloads
-- exposes a small HTTP API for verifier discovery and receipt lookup
+- test semantic-layer payloads produced by the IOVI SLDK
+- run a local verifier while building an app or integration
+- expose verifier endpoints that a client, playground, or agent can query
+- understand the receipt and checkpoint shape before running a production verifier
 
-## What It Is Not Yet
-
-This is a reference implementation, not a production verifier network.
-
-- State is in memory.
-- Receipt signatures are deterministic reference signatures, not production key signatures.
-- There is no indexed base-layer event feed yet.
-- The transition function is the current `declared-state-root-v1` proof contract: the payload declares the next state root, and the verifier checks ordering and continuity.
-- It does not submit transactions or custody wallets.
-
-## Install
+## Quick Start
 
 ```bash
 git clone https://github.com/bryfeng/iovi-reference-verifier.git
@@ -34,43 +22,34 @@ npm run check
 
 Node 22 or newer is expected.
 
-The package is source-first for now. Runtime verifier code is self-contained. Tests use `@bryaniovi/sldk` to generate realistic SLDK payloads.
-
 You can also install the current GitHub build into another Node project:
 
 ```bash
 npm install github:bryfeng/iovi-reference-verifier
 ```
 
-## Core Concepts
+If your app also needs to create semantic-layer payloads, install the SLDK:
 
-### SemanticLayerManifestV1
+```bash
+npm install @bryaniovi/sldk
+```
 
-A manifest describes one semantic layer:
+## How It Fits
 
-- `slId`: four-byte semantic-layer id
-- `ioviApi`: one developer-facing IOVI API URL
-- `publication`: the base-layer posting contract routes
-- `transitionFunction`: the rule the verifier is expected to run
-- `verifiers`: the verifier endpoints and receipt format clients should trust
-- `checkpointPolicy`: how many verifier receipts are required
+IOVI separates data publication from semantic verification.
 
-### VerifierReceiptV1
+- The SLDK creates local accounts, encodes semantic-layer payloads, and helps post them to EON.
+- The IOVI API prepares and relays base-layer postings without receiving private keys.
+- A verifier reads posted payloads, applies semantic-layer rules, and emits receipts.
 
-A receipt records a verifier decision:
+This repo is the verifier side of that flow. It does not sign transactions, relay transactions, hold wallets, or custody private material.
 
-- payload identity: `payloadHash`, optional `postingId`, optional `txHash`
-- semantic-layer position: `slId`, `sequence`
-- state transition: `stateRootBefore`, optional `stateRootAfter`
-- decision: `accepted` or `rejected`
-- verifier identity: `verifierId`, `signature`
-- checkpoint identity: `checkpointId`
+## First Verification
 
-Receipts are the bridge from "data was posted" to "this semantic layer accepts what that data means."
-
-## Library Usage
+This example creates a manifest, generates a realistic SLDK payload, verifies it, and prints the receipt verdict. It expects both `github:bryfeng/iovi-reference-verifier` and `@bryaniovi/sldk` to be installed.
 
 ```js
+import { encodeSemanticLayerTransition } from '@bryaniovi/sldk';
 import {
   CONTRACT_VERSION_V1,
   IoviReferenceVerifier,
@@ -92,7 +71,7 @@ const manifest = {
   },
   transitionFunction: {
     type: 'builtin',
-    name: 'declared-state-root-v1',
+    name: 'declared-state-root',
     version: '1.0.0'
   },
   verifiers: [
@@ -109,26 +88,45 @@ const manifest = {
   }
 };
 
-const verifier = new IoviReferenceVerifier({ manifest, initialStateRoot: ZERO_HASH });
+const payload = encodeSemanticLayerTransition({
+  slId: manifest.slId,
+  sequence: 1,
+  prevStateHash: ZERO_HASH,
+  newStateHash: `0x${'11'.repeat(32)}`,
+  actions: [
+    {
+      type: 'mint',
+      to: 'demo-user',
+      amount: 100
+    }
+  ]
+});
 
+const verifier = new IoviReferenceVerifier({ manifest });
 const receipt = verifier.verifyPayload({
-  payloadHex: '0x...',
-  payloadHash: '0x...',
-  postingId: 'posting-123',
-  txHash: '0x...'
+  payloadHex: payload.payloadHex,
+  payloadHash: payload.payloadHash,
+  postingId: 'demo-posting-1',
+  txHash: `0x${'22'.repeat(32)}`
 });
 
 console.log(receipt.verdict);
+console.log(receipt.checkpointId);
 ```
 
-## HTTP Usage
+The first payload is accepted because its sequence is `1` and its previous state root is the zero hash. A second payload must use sequence `2` and the first receipt's `stateRootAfter` as its previous state root.
+
+## Run an HTTP Verifier
+
+Using the same `manifest` object from the first example:
 
 ```js
 import { IoviReferenceVerifier, startReferenceVerifierServer } from '@bryaniovi/iovi-reference-verifier';
 
 const verifier = new IoviReferenceVerifier({ manifest });
 const server = await startReferenceVerifierServer(verifier, { port: 8787 });
-console.log(server.url);
+
+console.log(`Verifier listening at ${server.url}`);
 ```
 
 Routes:
@@ -136,21 +134,21 @@ Routes:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Readiness check |
-| `GET` | `/manifest` | Return the semantic-layer manifest |
+| `GET` | `/manifest` | Return the Semantic Layer Manifest |
 | `GET` | `/state` | Return current sequence and state root |
 | `GET` | `/checkpoints/latest` | Return the latest checkpoint view |
 | `GET` | `/receipts` | Return all in-memory receipts |
 | `GET` | `/receipts/:payloadHash` | Return one receipt by payload hash |
-| `POST` | `/verify` | Verify a posted payload or data scalars |
+| `POST` | `/verify` | Verify a payload or EON data scalars |
 
-`POST /verify` accepts:
+`POST /verify` accepts either `payloadHex` or `dataScalars`:
 
 ```json
 {
   "payloadHex": "0x...",
   "dataScalars": ["0000007a"],
   "postingId": "posting-123",
-  "txHash": "0x...",
+  "txHash": "0x2222222222222222222222222222222222222222222222222222222222222222",
   "payloadHash": "0x...",
   "timestamp": "2026-07-08T00:00:00.000Z",
   "metadata": {
@@ -159,21 +157,64 @@ Routes:
 }
 ```
 
-Use either `payloadHex` or `dataScalars`. `dataScalars` should be the EON `Data` scalar array emitted by the SLDK posting flow.
+`dataScalars` should be the EON `Data` scalar array emitted by the SLDK posting flow.
 
-## Idempotency Guidance
+## Core Primitives
 
-The verifier is idempotent around semantic position, not API submission. It rejects duplicate or out-of-order payloads because `sequence` and `prevStateHash` must match current verifier state.
+### Semantic Layer Manifest
 
-For posting APIs, keep a separate operation identity:
+A Semantic Layer Manifest tells clients how one semantic layer is published, verified, and checkpointed.
 
-- `postingId`: stable workflow id for one intended semantic-layer posting
-- `idempotencyKey`: retry key for API prepare/relay calls
+It includes:
+
+- `slId`: four-byte semantic-layer id
+- `ioviApi`: one developer-facing IOVI API URL
+- `publication`: the API routes used to register accounts, prepare postings, and relay signed postings
+- `transitionFunction`: the rule this verifier applies to payloads
+- `verifiers`: verifier endpoints and receipt formats clients should trust
+- `checkpointPolicy`: how many verifier receipts are required
+
+The current schema version is represented in code by `SemanticLayerManifestV1`.
+
+### Verifier Receipt
+
+A Verifier Receipt is the portable result of a verifier decision.
+
+It includes:
+
+- `payloadHash`: the encoded payload that was checked
+- `postingId`: the application workflow id, when available
+- `txHash`: the base-layer transaction id, when available
+- `sequence`: the semantic-layer sequence number
+- `verdict`: `accepted` or `rejected`
+- `stateRootBefore` and `stateRootAfter`: the semantic state transition
+- `checkpointId`: the verifier's checkpoint for this decision
+- `verifierId` and `signature`: the verifier identity and receipt signature
+
+The current schema version is represented in code by `VerifierReceiptV1`.
+
+## What Your App Should Store
+
+For each semantic-layer posting, store the identifiers that let you reconnect the full path later:
+
+- `postingId`: stable workflow id for the intended posting
+- `idempotencyKey`: retry key for prepare and relay calls
 - `payloadHash`: content id for the encoded semantic payload
-- `txHash`: base-layer transaction id
-- `checkpointId`: verifier state checkpoint id
+- `txHash`: base-layer transaction id after relay
+- `checkpointId`: verifier checkpoint id after verification
+- `verdict`: verifier decision
 
-The SLDK should help developers generate stable `postingId` and `idempotencyKey` values, but APIs still need to enforce them because only the API sees concurrent retries and relay state.
+The SLDK should help generate stable operation ids. APIs still need to enforce idempotency because they are the concurrency boundary for retries, duplicate submissions, and relay state. The verifier then gives semantic replay protection through `sequence`, `prevStateHash`, and `payloadHash`.
+
+## Current Limits
+
+This is a reference implementation, not a production verifier network.
+
+- State is in memory.
+- Receipt signatures are deterministic reference signatures, not production key signatures.
+- There is no indexed base-layer event feed yet.
+- The built-in transition function checks ordering and state-root continuity, but it does not execute arbitrary application logic yet.
+- It does not submit transactions or custody wallets.
 
 ## Development
 
@@ -186,7 +227,7 @@ npm run check
 
 ## Roadmap
 
-- persistent receipt/checkpoint store
+- persistent receipt and checkpoint store
 - production verifier signing keys
 - indexed base-layer event ingestion
 - pluggable transition functions
