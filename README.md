@@ -1,14 +1,15 @@
 # IOVI Reference Verifier
 
-Run a local verifier for IOVI semantic-layer payloads.
+Run a local reference verifier platform for IOVI semantic-layer payloads.
 
-The Reference Verifier checks that an encoded semantic-layer payload belongs to the expected semantic layer, follows the next valid sequence number, and continues from the previous accepted state root. It returns a Verifier Receipt that your app can store, display, or pass to another system as evidence of the verifier's decision.
+In the current model, a verifier is a third-party platform. Semantic layers register with the verifier by public address, declare the codec and proof standard they use, and then the verifier can pull or receive base-layer payloads, verify them, maintain its own accepted state, and emit Verifier Receipts.
 
 Use this repo when you want to:
 
 - test semantic-layer payloads produced by the IOVI SLDK
-- run a local verifier while building an app or integration
-- expose verifier endpoints that a client, playground, or agent can query
+- register one or more semantic layers with a verifier
+- verify payloads under the registered codec and proof standard
+- expose verifier endpoints that clients, playgrounds, or agents can query
 - understand the receipt and checkpoint shape before running a production verifier
 
 ## Quick Start
@@ -40,64 +41,54 @@ IOVI separates data publication from semantic verification.
 
 - The SLDK creates local accounts, encodes semantic-layer payloads, and helps post them to EON.
 - The IOVI API prepares and relays base-layer postings without receiving private keys.
-- A verifier reads posted payloads, applies semantic-layer rules, and emits receipts.
+- A verifier platform registers semantic layers, indexes or receives their payloads, verifies transitions, and emits receipts.
 
-This repo is the verifier side of that flow. It does not sign transactions, relay transactions, hold wallets, or custody private material.
+This repo is the verifier side of that flow. It does not sign base-layer transactions, relay transactions, hold wallets, or custody private material.
 
-The current reference implementation verifies one semantic layer at a time because that is the smallest useful proof. A production verifier should usually support many semantic layers. In that model, the verifier keeps a registry keyed by `slId`:
+## Core Model
 
-- `slId -> Semantic Layer Manifest`
-- `slId -> current state and checkpoint`
-- `slId -> receipts`
+The semantic-layer identity is the semantic layer's public address.
 
-When a payload arrives, the verifier decodes the `slId`, loads the matching manifest, applies that layer's transition rule, and emits a receipt scoped to that semantic layer.
+The verifier registry is keyed by that address:
+
+- `semanticLayerAddress -> registration`
+- `semanticLayerAddress -> codec and proof standard`
+- `semanticLayerAddress -> current verified state`
+- `semanticLayerAddress -> receipts`
+
+A separate `slId` is not the core identity. The current SLDK payload codec still includes a compact `slId`, so this reference verifier supports `legacySlId` as a bridge. Future payload codecs should be able to route by signer, publisher, owner, or explicit semantic-layer address instead.
 
 ## First Verification
 
-This example creates a manifest, generates a realistic SLDK payload, verifies it, and prints the receipt verdict. It expects both `github:bryfeng/iovi-reference-verifier` and `@bryaniovi/sldk` to be installed.
+This example registers a semantic layer by address, generates a realistic SLDK payload, verifies it, and prints the receipt verdict.
 
 ```js
 import { encodeSemanticLayerTransition } from '@bryaniovi/sldk';
 import {
-  CONTRACT_VERSION_V1,
   IoviReferenceVerifier,
-  VERIFIER_RECEIPT_V1_FORMAT,
-  ZERO_HASH
+  ZERO_HASH,
+  buildSemanticLayerRegistration
 } from '@bryaniovi/iovi-reference-verifier';
 
-const manifest = {
-  manifestVersion: CONTRACT_VERSION_V1,
-  slId: '00010001',
+const semanticLayerAddress = '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+
+const registration = buildSemanticLayerRegistration({
+  semanticLayerAddress,
   name: 'Demo Asset Layer',
-  version: '1.0.0',
-  ioviApi: 'https://iovi-api-production.up.railway.app',
-  payloadCodec: 'iovi-payload-v1',
-  publication: {
-    accountRegistrationRoute: '/v1/base-layer/accounts',
-    preparePostingRoute: '/v1/semantic-payloads/prepare-posting',
-    postingRoute: '/v1/base-layer/postings'
-  },
-  transitionFunction: {
-    type: 'builtin',
-    name: 'declared-state-root',
-    version: '1.0.0'
-  },
-  verifiers: [
-    {
-      name: 'IOVI Reference Verifier',
-      endpoint: 'http://127.0.0.1:8787',
-      verifierId: 'did:key:iovi-reference-verifier',
-      receiptFormat: VERIFIER_RECEIPT_V1_FORMAT
-    }
-  ],
-  checkpointPolicy: {
-    type: 'single',
-    requiredVerifiers: 1
-  }
-};
+  codec: 'iovi-payload-v1',
+  proofStandard: 'declared-state-root',
+  legacySlId: '00010001',
+  publisherAddress: semanticLayerAddress,
+  registrationUtxoId: 'utxo-registration-demo',
+  signature: 'reference-signature'
+});
+
+const verifier = new IoviReferenceVerifier({
+  registrations: [registration]
+});
 
 const payload = encodeSemanticLayerTransition({
-  slId: manifest.slId,
+  slId: '00010001',
   sequence: 1,
   prevStateHash: ZERO_HASH,
   newStateHash: `0x${'11'.repeat(32)}`,
@@ -110,7 +101,6 @@ const payload = encodeSemanticLayerTransition({
   ]
 });
 
-const verifier = new IoviReferenceVerifier({ manifest });
 const receipt = verifier.verifyPayload({
   payloadHex: payload.payloadHex,
   payloadHash: payload.payloadHash,
@@ -119,19 +109,48 @@ const receipt = verifier.verifyPayload({
 });
 
 console.log(receipt.verdict);
+console.log(receipt.semanticLayerAddress);
 console.log(receipt.checkpointId);
 ```
 
-The first payload is accepted because its sequence is `1` and its previous state root is the zero hash. A second payload must use sequence `2` and the first receipt's `stateRootAfter` as its previous state root.
+The first payload is accepted because its sequence is `1` and its previous state root is the zero hash. A second payload for the same semantic-layer address must use sequence `2` and the first receipt's `stateRootAfter` as its previous state root.
+
+## Registration
+
+A registration tells a verifier how to handle a semantic layer.
+
+It includes:
+
+- `semanticLayerAddress`: the public address that identifies the semantic layer
+- `codec`: the payload language, such as `iovi-payload-v1`
+- `proofStandard`: the verification rule or proof family, such as `declared-state-root`
+- `publisherAddress`: the key or address authorized to publish the registration
+- `registrationTxHash` or `registrationUtxoId`: optional base-layer anchoring evidence
+- `legacySlId`: optional bridge for the current SLDK payload codec
+- `manifestUrl` and `manifestHash`: optional public metadata
+- `signature`: registration authorization evidence
+
+In production, the registration should be anchored to the base layer. A semantic layer can post a compact registration object or pointer as a data-bearing UTXO, then give the verifier the UTXO id or transaction hash. The verifier can fetch that base-layer object, validate the public address and signature, and register the semantic layer.
+
+This reference package validates the registration shape and supported standards. It does not yet verify a production EON signature for the registration.
+
+## Manifests Are Optional
+
+A manifest is no longer required to use the verifier.
+
+A manifest is useful when a semantic layer wants a richer public document for developers: schemas, docs, endpoints, verifier references, upgrade policy, and other metadata. It can be attached to registration through `manifestUrl`, `manifestHash`, or an embedded manifest object.
+
+For closed integrations, a registration can be enough. For public interoperability, a manifest is a recommended best practice, not a protocol requirement.
 
 ## Run an HTTP Verifier
-
-Using the same `manifest` object from the first example:
 
 ```js
 import { IoviReferenceVerifier, startReferenceVerifierServer } from '@bryaniovi/iovi-reference-verifier';
 
-const verifier = new IoviReferenceVerifier({ manifest });
+const verifier = new IoviReferenceVerifier({
+  registrations: [registration]
+});
+
 const server = await startReferenceVerifierServer(verifier, { port: 8787 });
 
 console.log(`Verifier listening at ${server.url}`);
@@ -142,17 +161,23 @@ Routes:
 | Method | Path | Purpose |
 | --- | --- | --- |
 | `GET` | `/health` | Readiness check |
-| `GET` | `/manifest` | Return the Semantic Layer Manifest |
-| `GET` | `/state` | Return current sequence and state root |
-| `GET` | `/checkpoints/latest` | Return the latest checkpoint view |
-| `GET` | `/receipts` | Return all in-memory receipts |
-| `GET` | `/receipts/:payloadHash` | Return one receipt by payload hash |
+| `GET` | `/registrations` | List registered semantic layers |
+| `POST` | `/registrations` | Register a semantic layer |
+| `GET` | `/registrations/:address` | Read one registration |
+| `GET` | `/semantic-layers` | Alias for registration list |
+| `GET` | `/semantic-layers/:address` | Read one semantic layer registration |
+| `GET` | `/semantic-layers/:address/state` | Read one semantic layer's verified state |
+| `GET` | `/semantic-layers/:address/receipts` | Read receipts for one semantic layer |
+| `GET` | `/state` | Read all verifier states |
+| `GET` | `/receipts` | Read all receipts |
+| `GET` | `/receipts/:payloadHash` | Read one receipt by payload hash |
 | `POST` | `/verify` | Verify a payload or EON data scalars |
 
 `POST /verify` accepts either `payloadHex` or `dataScalars`:
 
 ```json
 {
+  "semanticLayerAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "payloadHex": "0x...",
   "dataScalars": ["0000007a"],
   "postingId": "posting-123",
@@ -165,61 +190,16 @@ Routes:
 }
 ```
 
-`dataScalars` should be the EON `Data` scalar array emitted by the SLDK posting flow.
+If `semanticLayerAddress` is omitted, the verifier can route current `iovi-payload-v1` payloads by registered `legacySlId`.
 
-## Core Primitives
-
-### Semantic Layer Manifest
-
-A Semantic Layer Manifest is the public contract for one semantic layer. It is not the verifier's global config.
-
-The manifest tells clients and verifiers how that semantic layer is published, verified, and checkpointed.
-
-It includes:
-
-- `slId`: four-byte semantic-layer id
-- `ioviApi`: one developer-facing IOVI API URL
-- `publication`: the API routes used to register accounts, prepare postings, and relay signed postings
-- `transitionFunction`: the rule this verifier applies to payloads
-- `verifiers`: verifier endpoints and receipt formats clients should trust
-- `checkpointPolicy`: how many verifier receipts are required
-
-The current schema version is represented in code by `SemanticLayerManifestV1`.
-
-### Publishing a Manifest
-
-For local development, you can pass the manifest directly into `new IoviReferenceVerifier({ manifest })`.
-
-For public or multi-party use, the semantic layer should publish its manifest somewhere clients and verifiers can resolve it. The practical progression is:
-
-- Start with signed JSON at a stable HTTPS URL.
-- Include the manifest URL and manifest hash in app docs, verifier config, or semantic-layer metadata.
-- Later, publish a compact manifest pointer on EON with `slId`, URL, version, hash, and publisher signature.
-- A directory semantic layer or registry API can index those pointers so clients can discover semantic layers and verifier endpoints.
-
-The manifest itself does not have to be large or fully on-chain. The important property is that clients can identify the exact manifest they are trusting, and verifiers can prove which manifest they used when producing a receipt.
-
-### Is a Manifest Required?
-
-Not for every toy or closed integration. A single app can hardcode `slId`, codec, transition rules, and verifier endpoint.
-
-For an open semantic-layer ecosystem, a manifest becomes important because it gives independent developers a shared contract:
-
-- how to encode payloads
-- where to publish them
-- which verifier endpoints are expected
-- which receipt format is valid
-- which transition function governs acceptance
-- which checkpoint policy clients should trust
-
-So the manifest is not the thing that makes verification mathematically possible. It is the thing that makes verification discoverable, portable, and composable across teams.
-
-### Verifier Receipt
+## Verifier Receipt
 
 A Verifier Receipt is the portable result of a verifier decision.
 
 It includes:
 
+- `semanticLayerAddress`: the registered semantic-layer identity
+- `registrationHash`: hash of the registration used by the verifier
 - `payloadHash`: the encoded payload that was checked
 - `postingId`: the application workflow id, when available
 - `txHash`: the base-layer transaction id, when available
@@ -235,6 +215,8 @@ The current schema version is represented in code by `VerifierReceiptV1`.
 
 For each semantic-layer posting, store the identifiers that let you reconnect the full path later:
 
+- `semanticLayerAddress`: the public address that identifies the semantic layer
+- `registrationHash`: the verifier registration used for the decision
 - `postingId`: stable workflow id for the intended posting
 - `idempotencyKey`: retry key for prepare and relay calls
 - `payloadHash`: content id for the encoded semantic payload
@@ -242,17 +224,18 @@ For each semantic-layer posting, store the identifiers that let you reconnect th
 - `checkpointId`: verifier checkpoint id after verification
 - `verdict`: verifier decision
 
-The SLDK should help generate stable operation ids. APIs still need to enforce idempotency because they are the concurrency boundary for retries, duplicate submissions, and relay state. The verifier then gives semantic replay protection through `sequence`, `prevStateHash`, and `payloadHash`.
+The SLDK should help generate stable operation ids. APIs still need to enforce idempotency because they are the concurrency boundary for retries, duplicate submissions, and relay state. The verifier then gives semantic replay protection through sequence, previous state root, payload hash, and registration hash.
 
 ## Current Limits
 
 This is a reference implementation, not a production verifier network.
 
 - State is in memory.
-- One `IoviReferenceVerifier` instance handles one semantic layer at a time.
+- Registration signatures are shape-checked but not production-verified.
 - Receipt signatures are deterministic reference signatures, not production key signatures.
 - There is no indexed base-layer event feed yet.
 - The built-in transition function checks ordering and state-root continuity, but it does not execute arbitrary application logic yet.
+- The current SLDK payload codec still uses `slId`, so `legacySlId` remains as a compatibility bridge.
 - It does not submit transactions or custody wallets.
 
 ## Development
@@ -266,10 +249,11 @@ npm run check
 
 ## Roadmap
 
-- persistent receipt and checkpoint store
+- production registration signature verification
+- base-layer registration UTXO fetch and validation
+- persistent registration, receipt, and checkpoint store
 - production verifier signing keys
 - indexed base-layer event ingestion
-- pluggable transition functions
+- pluggable codecs and proof standards
 - hosted reference verifier deployment
-- playground verifier-source selection
-- shared protocol package for manifests, receipts, and idempotency helpers
+- shared protocol package for registrations, receipts, and idempotency helpers

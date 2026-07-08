@@ -3,7 +3,7 @@
   "version": "0.1.0-alpha.0",
   "type": "module",
   "private": true,
-  "description": "Standalone IOVI Reference Verifier proof around SemanticLayerManifestV1 and VerifierReceiptV1.",
+  "description": "Reference verifier platform for registered IOVI semantic layers and verifier receipts.",
   "license": "MIT",
   "engines": {
     "node": ">=22"
