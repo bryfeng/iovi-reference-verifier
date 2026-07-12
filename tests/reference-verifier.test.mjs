@@ -149,7 +149,18 @@ test('reference verifier HTTP server exposes registration, state, receipts, and 
 
     const receiptResponse = await fetch(`${server.url}/receipts/${encodeURIComponent(payload.payloadHash)}`);
     assert.equal(receiptResponse.status, 200);
-    assert.equal((await receiptResponse.json()).payloadHash, payload.payloadHash);
+    const storedReceipt = await receiptResponse.json();
+    assert.equal(storedReceipt.payloadHash, payload.payloadHash);
+
+    const receiptIdResponse = await fetch(
+      `${server.url}/receipts/by-id/${encodeURIComponent(storedReceipt.receiptId)}`
+    );
+    assert.equal(receiptIdResponse.status, 200);
+    assert.equal((await receiptIdResponse.json()).receiptId, storedReceipt.receiptId);
+
+    const submissionsResponse = await fetch(`${server.url}/submissions`);
+    assert.equal(submissionsResponse.status, 200);
+    assert.equal((await submissionsResponse.json()).submissions.length, 1);
 
     const stateResponse = await fetch(`${server.url}/semantic-layers/${encodeURIComponent(LAYER_A_ADDRESS)}/state`);
     assert.equal(stateResponse.status, 200);

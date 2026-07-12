@@ -21,7 +21,7 @@ npm install
 npm run check
 ```
 
-Node 22 or newer is expected.
+Node 22.13 or newer is expected.
 
 You can also install the current GitHub build into another Node project:
 
@@ -57,6 +57,41 @@ The verifier registry is keyed by that address:
 - `semanticLayerAddress -> receipts`
 
 A separate `slId` is not the core identity. The current SLDK payload codec still includes a compact `slId`, so this reference verifier supports `legacySlId` as a bridge. Future payload codecs should be able to route by signer, publisher, owner, or explicit semantic-layer address instead.
+
+The default repository is in memory. A SQLite repository is available from the `@bryaniovi/iovi-reference-verifier/sqlite` subpath. Both implement the same protocol-neutral storage port; neither stores semantic-layer domain records.
+
+The persistence and idempotency contract is specified in [docs/persistence-contract-v1.md](docs/persistence-contract-v1.md).
+
+## Durable SQLite Verifier
+
+```js
+import {
+  IoviReferenceVerifier,
+  buildSemanticLayerRegistration
+} from '@bryaniovi/iovi-reference-verifier';
+import {
+  SqliteReferenceVerifierRepository
+} from '@bryaniovi/iovi-reference-verifier/sqlite';
+
+const repository = new SqliteReferenceVerifierRepository('./verifier.sqlite');
+const verifier = new IoviReferenceVerifier({
+  verifierId: 'did:key:my-reference-verifier',
+  repository
+});
+
+verifier.registerSemanticLayer(buildSemanticLayerRegistration({
+  semanticLayerAddress: '0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+  codec: 'iovi-payload-v1',
+  proofStandard: 'declared-state-root',
+  legacySlId: '00010001'
+}));
+
+// Registrations, payloads, submissions, receipts, accepted state, and
+// checkpoints survive verifier.close() and a new repository instance.
+verifier.close();
+```
+
+The adapter uses Node's built-in `node:sqlite` module and deterministic migrations. Node 22 and 23 may label that module experimental; the SQLite dependency remains isolated behind the repository port.
 
 ## First Verification
 
@@ -171,6 +206,8 @@ Routes:
 | `GET` | `/state` | Read all verifier states |
 | `GET` | `/receipts` | Read all receipts |
 | `GET` | `/receipts/:payloadHash` | Read one receipt by payload hash |
+| `GET` | `/receipts/by-id/:receiptId` | Read one receipt by receipt ID |
+| `GET` | `/submissions` | Read persisted submission and retry references |
 | `POST` | `/verify` | Verify a payload or EON data scalars |
 
 `POST /verify` accepts either `payloadHex` or `dataScalars`:
@@ -198,6 +235,7 @@ A Verifier Receipt is the portable result of a verifier decision.
 
 It includes:
 
+- `receiptId`: deterministic identity for this verifier decision
 - `semanticLayerAddress`: the registered semantic-layer identity
 - `registrationHash`: hash of the registration used by the verifier
 - `payloadHash`: the encoded payload that was checked
@@ -206,10 +244,12 @@ It includes:
 - `sequence`: the semantic-layer sequence number
 - `verdict`: `accepted` or `rejected`
 - `stateRootBefore` and `stateRootAfter`: the semantic state transition
-- `checkpointId`: the verifier's checkpoint for this decision
+- `checkpointId`: accepted state checkpoint; present only when the verdict is `accepted`
 - `verifierId` and `signature`: the verifier identity and receipt signature
 
 The current schema version is represented in code by `VerifierReceiptV1`.
+
+Every accepted transition advances the semantic-layer head and checkpoint atomically. Rejected attempts receive a receipt but never replace the accepted checkpoint. Repeating an already accepted payload returns its canonical receipt without advancing state again. State-dependent rejections can be evaluated again under a new submission identity after the accepted head changes.
 
 ## What Your App Should Store
 
@@ -230,7 +270,7 @@ The SLDK should help generate stable operation ids. APIs still need to enforce i
 
 This is a reference implementation, not a production verifier network.
 
-- State is in memory.
+- The default repository is in memory; the SQLite adapter provides single-node durability, not replicated database consensus.
 - Registration signatures are shape-checked but not production-verified.
 - Receipt signatures are deterministic reference signatures, not production key signatures.
 - There is no indexed base-layer event feed yet.
@@ -251,7 +291,7 @@ npm run check
 
 - production registration signature verification
 - base-layer registration UTXO fetch and validation
-- persistent registration, receipt, and checkpoint store
+- production-grade storage driver and backup policy beyond the SQLite reference adapter
 - production verifier signing keys
 - indexed base-layer event ingestion
 - pluggable codecs and proof standards

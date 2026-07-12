@@ -1,6 +1,28 @@
 import { createHash } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 
+import {
+  InMemoryReferenceVerifierRepository,
+  ReferenceVerifierRepositoryConflictError,
+  type ReferenceVerifierRepository,
+  type StoredSemanticLayerV1,
+  type StoredSubmissionV1
+} from './repository.js';
+
+export {
+  InMemoryReferenceVerifierRepository,
+  ReferenceVerifierRepositoryConflictError
+} from './repository.js';
+export type {
+  AcceptedHeadUpdateV1,
+  ReferenceVerifierRepository,
+  StoredCheckpointV1,
+  StoredPayloadV1,
+  StoredRegistrationVersionV1,
+  StoredSemanticLayerV1,
+  StoredSubmissionV1
+} from './repository.js';
+
 export const SEMANTIC_LAYER_MANIFEST_V1_FORMAT = 'iovi-semantic-layer-manifest-v1';
 export const SEMANTIC_LAYER_REGISTRATION_V1_FORMAT = 'iovi-semantic-layer-registration-v1';
 export const VERIFIER_RECEIPT_V1_FORMAT = 'iovi-verifier-receipt-v1';
@@ -135,6 +157,7 @@ export type VerifierReceipt = VerifierReceiptV1;
 export type VerifierReceiptV1 = {
   receiptVersion: typeof CONTRACT_VERSION_V1;
   receiptFormat: typeof VERIFIER_RECEIPT_V1_FORMAT;
+  receiptId: string;
   semanticLayerAddress: string;
   registrationHash?: string;
   slId?: string;
@@ -149,7 +172,7 @@ export type VerifierReceiptV1 = {
   remediation?: string;
   stateRootBefore: string;
   stateRootAfter?: string;
-  checkpointId: string;
+  checkpointId?: string;
   verifierId: string;
   signature: string;
   timestamp: string;
@@ -182,6 +205,7 @@ export type ReferenceVerifierPayloadInput = {
   txHash?: string;
   payloadHash?: string;
   payloadSize?: number;
+  idempotencyKey?: string;
   timestamp?: string;
   metadata?: Record<string, unknown>;
 };
@@ -201,6 +225,7 @@ export type ReferenceVerifierOptions = {
   manifest?: SemanticLayerManifestV1;
   semanticLayerAddress?: string;
   initialStateRoot?: string;
+  repository?: ReferenceVerifierRepository;
 };
 
 export type ReferenceVerifierServer = {
@@ -241,6 +266,7 @@ export function assertValidVerifierReceiptV1(receipt: VerifierReceiptV1): void {
   assertNoPrivateMaterial(receipt);
   assertExact(receipt.receiptVersion, CONTRACT_VERSION_V1, 'receiptVersion');
   assertExact(receipt.receiptFormat, VERIFIER_RECEIPT_V1_FORMAT, 'receiptFormat');
+  assertHexHash(receipt.receiptId, 'receiptId');
   assertSemanticLayerAddress(receipt.semanticLayerAddress, 'semanticLayerAddress');
   if (receipt.registrationHash !== undefined) assertHexHash(receipt.registrationHash, 'registrationHash');
   if (receipt.slId !== undefined) assertHexBytes(receipt.slId, 4, 'slId');
@@ -253,7 +279,13 @@ export function assertValidVerifierReceiptV1(receipt: VerifierReceiptV1): void {
   }
   assertHexHash(receipt.stateRootBefore, 'stateRootBefore');
   if (receipt.stateRootAfter !== undefined) assertHexHash(receipt.stateRootAfter, 'stateRootAfter');
-  assertNonEmpty(receipt.checkpointId, 'checkpointId');
+  if (receipt.verdict === 'accepted') {
+    if (receipt.stateRootAfter === undefined) throw new Error('accepted receipt requires stateRootAfter');
+    if (receipt.checkpointId === undefined) throw new Error('accepted receipt requires checkpointId');
+    assertHexHash(receipt.checkpointId, 'checkpointId');
+  } else if (receipt.checkpointId !== undefined) {
+    throw new Error('rejected receipt must not include checkpointId');
+  }
   assertNonEmpty(receipt.verifierId, 'verifierId');
   assertNonEmpty(receipt.signature, 'signature');
   assertDateTime(receipt.timestamp, 'timestamp');
@@ -420,26 +452,38 @@ export function decodeSemanticLayerTransition(payloadHex: string): DecodedSemant
   };
 }
 
-type RegisteredSemanticLayer = {
-  registration: SemanticLayerRegistrationV1;
-  registrationHash: string;
-  sequence: number;
-  stateRoot: string;
-  receipts: VerifierReceiptV1[];
+type RegisteredSemanticLayer = StoredSemanticLayerV1;
+
+type ObservedPayload = {
+  payloadHex: string;
+  payloadHash: string;
+  payloadSize: number;
 };
+
+export class ReferenceVerifierIdempotencyConflictError extends Error {
+  readonly code = 'VERIFIER_IDEMPOTENCY_CONFLICT';
+
+  constructor(message: string) {
+    super(message);
+    this.name = 'ReferenceVerifierIdempotencyConflictError';
+  }
+}
 
 export class IoviReferenceVerifier {
   readonly verifierId: string;
-  private readonly registrations = new Map<string, RegisteredSemanticLayer>();
-  private readonly legacySlIdIndex = new Map<string, string>();
-  private readonly receipts: VerifierReceiptV1[] = [];
+  readonly repository: ReferenceVerifierRepository;
 
   constructor(options: ReferenceVerifierOptions = {}) {
-    this.verifierId = options.verifierId ?? options.manifest?.verifiers[0]?.verifierId ?? 'did:key:iovi-reference-verifier';
+    this.verifierId =
+      options.verifierId ??
+      options.manifest?.verifiers[0]?.verifierId ??
+      'did:key:iovi-reference-verifier';
+    this.repository = options.repository ?? new InMemoryReferenceVerifierRepository();
     if (options.manifest !== undefined) {
       this.registerSemanticLayer(
         buildSemanticLayerRegistration({
-          semanticLayerAddress: options.semanticLayerAddress ?? `legacy-sl:${stripHex(options.manifest.slId)}`,
+          semanticLayerAddress:
+            options.semanticLayerAddress ?? `legacy-sl:${stripHex(options.manifest.slId)}`,
           codec: options.manifest.payloadCodec,
           proofStandard:
             options.manifest.transitionFunction.type === 'builtin'
@@ -459,41 +503,64 @@ export class IoviReferenceVerifier {
     }
   }
 
+  close(): void {
+    this.repository.close();
+  }
+
   registerSemanticLayer(
     registration: SemanticLayerRegistrationV1,
-    options: { initialStateRoot?: string } = {}
+    options: { initialStateRoot?: string; registeredAt?: string } = {}
   ): SemanticLayerRegistrationV1 {
     assertSupportedReferenceRegistration(registration);
     const semanticLayerAddress = normalizeSemanticLayerAddress(registration.semanticLayerAddress);
-    const normalizedRegistration = {
+    const normalizedRegistration = removeUndefined({
       ...registration,
-      semanticLayerAddress
-    };
+      semanticLayerAddress,
+      legacySlId:
+        registration.legacySlId === undefined ? undefined : stripHex(registration.legacySlId)
+    }) as SemanticLayerRegistrationV1;
     const registrationHash = semanticLayerRegistrationV1Hash(normalizedRegistration);
-    const existing = this.registrations.get(semanticLayerAddress);
-    this.registrations.set(semanticLayerAddress, {
-      registration: normalizedRegistration,
-      registrationHash,
-      sequence: existing?.sequence ?? 0,
-      stateRoot: existing?.stateRoot ?? options.initialStateRoot ?? ZERO_HASH,
-      receipts: existing?.receipts ?? []
+    return this.repository.transaction(() => {
+      const existing = this.repository.getSemanticLayer(semanticLayerAddress);
+      if (existing !== undefined) {
+        if (existing.registrationHash !== registrationHash) {
+          throw new ReferenceVerifierRepositoryConflictError(
+            `semantic layer ${semanticLayerAddress} already has active registration ${existing.registrationHash}; explicit upgrades are not supported in V1`
+          );
+        }
+        return existing.registration;
+      }
+      this.repository.insertSemanticLayer({
+        registration: normalizedRegistration,
+        registrationHash,
+        sequence: 0,
+        stateRoot: normalizeHash(options.initialStateRoot ?? ZERO_HASH),
+        registeredAt: options.registeredAt ?? new Date().toISOString()
+      });
+      return normalizedRegistration;
     });
-    if (registration.legacySlId !== undefined) {
-      this.legacySlIdIndex.set(stripHex(registration.legacySlId), semanticLayerAddress);
-    }
-    return normalizedRegistration;
   }
 
   listRegistrations(): Array<SemanticLayerRegistrationV1 & { registrationHash: string }> {
-    return [...this.registrations.values()].map((registered) => ({
+    return this.repository.listSemanticLayers().map((registered) => ({
       ...registered.registration,
       registrationHash: registered.registrationHash
     }));
   }
 
-  getRegistration(semanticLayerAddress: string): (SemanticLayerRegistrationV1 & { registrationHash: string }) | undefined {
-    const registered = this.registrations.get(normalizeSemanticLayerAddress(semanticLayerAddress));
-    if (!registered) return undefined;
+  listRegistrationVersions(semanticLayerAddress: string) {
+    return this.repository.listRegistrationVersions(
+      normalizeSemanticLayerAddress(semanticLayerAddress)
+    );
+  }
+
+  getRegistration(
+    semanticLayerAddress: string
+  ): (SemanticLayerRegistrationV1 & { registrationHash: string }) | undefined {
+    const registered = this.repository.getSemanticLayer(
+      normalizeSemanticLayerAddress(semanticLayerAddress)
+    );
+    if (registered === undefined) return undefined;
     return {
       ...registered.registration,
       registrationHash: registered.registrationHash
@@ -501,86 +568,230 @@ export class IoviReferenceVerifier {
   }
 
   getState(semanticLayerAddress: string): ReferenceVerifierState {
-    const registered = this.requireRegisteredSemanticLayer(semanticLayerAddress);
-    return this.stateFor(registered);
+    return this.stateFor(this.requireRegisteredSemanticLayer(semanticLayerAddress));
   }
 
   listStates(): ReferenceVerifierState[] {
-    return [...this.registrations.values()].map((registered) => this.stateFor(registered));
+    return this.repository.listSemanticLayers().map((registered) => this.stateFor(registered));
   }
 
   listReceipts(input: { semanticLayerAddress?: string } = {}): VerifierReceiptV1[] {
-    if (input.semanticLayerAddress === undefined) return [...this.receipts];
-    return [...this.requireRegisteredSemanticLayer(input.semanticLayerAddress).receipts];
+    return this.repository.listReceipts({
+      semanticLayerAddress:
+        input.semanticLayerAddress === undefined
+          ? undefined
+          : normalizeSemanticLayerAddress(input.semanticLayerAddress)
+    });
+  }
+
+  listSubmissions(input: { semanticLayerAddress?: string } = {}): StoredSubmissionV1[] {
+    return this.repository.listSubmissions({
+      semanticLayerAddress:
+        input.semanticLayerAddress === undefined
+          ? undefined
+          : normalizeSemanticLayerAddress(input.semanticLayerAddress)
+    });
   }
 
   getReceipt(payloadHash: string): VerifierReceiptV1 | undefined {
-    return this.receipts.find((receipt) => receipt.payloadHash === payloadHash);
+    return this.repository.getReceiptByPayloadHash(normalizeHash(payloadHash));
+  }
+
+  getReceiptById(receiptId: string): VerifierReceiptV1 | undefined {
+    return this.repository.getReceiptById(normalizeHash(receiptId));
   }
 
   verifyPayload(input: ReferenceVerifierPayloadInput): VerifierReceiptV1 {
-    const timestamp = input.timestamp ?? new Date().toISOString();
-    let decoded: DecodedSemanticLayerTransition | undefined;
-    let registered: RegisteredSemanticLayer | undefined;
-    try {
-      const payloadHex = input.payloadHex ?? scalarHexToPayloadHex(input.dataScalars ?? []);
-      decoded = decodeSemanticLayerTransition(payloadHex);
-      registered = this.resolveRegistration(input, decoded);
-      const expectedPayloadHash = input.payloadHash ?? decoded.payloadHash;
-      if (decoded.payloadHash !== expectedPayloadHash) {
-        throw new Error(`payload hash mismatch: expected ${expectedPayloadHash}, decoded ${decoded.payloadHash}`);
-      }
-      if (
-        registered.registration.legacySlId !== undefined &&
-        stripHex(decoded.slId) !== stripHex(registered.registration.legacySlId)
-      ) {
-        throw new Error(`legacy slId mismatch: expected ${registered.registration.legacySlId}, got ${decoded.slId}`);
-      }
-
-      const expectedSequence = registered.sequence + 1;
-      if (Number(decoded.sequence) !== expectedSequence) {
-        throw new Error(`sequence mismatch: expected ${expectedSequence}, got ${decoded.sequence.toString()}`);
-      }
-      if (normalizeHash(decoded.prevStateHash) !== normalizeHash(registered.stateRoot)) {
-        throw new Error(`prevStateHash mismatch: expected ${registered.stateRoot}, got ${decoded.prevStateHash}`);
-      }
-
-      const receipt = this.buildReceipt({
-        input,
-        registration: registered,
-        decoded,
-        timestamp,
-        payloadHash: decoded.payloadHash,
-        payloadSize: decoded.payloadSize,
-        sequence: Number(decoded.sequence),
-        verdict: 'accepted',
-        stateRootBefore: registered.stateRoot,
-        stateRootAfter: decoded.newStateHash
-      });
-      registered.sequence = Number(decoded.sequence);
-      registered.stateRoot = decoded.newStateHash;
-      registered.receipts.push(receipt);
-      this.receipts.push(receipt);
-      return receipt;
-    } catch (error) {
-      const fallbackRegistration = registered ?? this.rejectionRegistration(input, decoded);
-      const receipt = this.buildReceipt({
-        input,
-        registration: fallbackRegistration,
-        decoded,
-        timestamp,
-        payloadHash: input.payloadHash ?? decoded?.payloadHash ?? digestHex(JSON.stringify(input)),
-        payloadSize: input.payloadSize ?? decoded?.payloadSize,
-        sequence: Number(decoded?.sequence ?? BigInt(fallbackRegistration.sequence + 1)),
-        verdict: 'rejected',
-        reason: error instanceof Error ? error.message : String(error),
-        stateRootBefore: fallbackRegistration.stateRoot,
-        stateRootAfter: fallbackRegistration.stateRoot
-      });
-      fallbackRegistration.receipts.push(receipt);
-      this.receipts.push(receipt);
-      return receipt;
+    assertNoPrivateMaterial(input);
+    if (input.idempotencyKey !== undefined) {
+      assertNonEmpty(input.idempotencyKey, 'idempotencyKey');
     }
+    const timestamp = input.timestamp ?? new Date().toISOString();
+    const requestFingerprint = verifierRequestFingerprint(input);
+
+    return this.repository.transaction(() => {
+      if (input.idempotencyKey !== undefined) {
+        const priorSubmission = this.repository.getSubmissionByIdempotencyKey(
+          input.idempotencyKey
+        );
+        if (priorSubmission !== undefined) {
+          if (priorSubmission.requestFingerprint !== requestFingerprint) {
+            throw new ReferenceVerifierIdempotencyConflictError(
+              `idempotency key ${input.idempotencyKey} was already used for different verifier input`
+            );
+          }
+          const priorReceipt = this.repository.getReceiptById(priorSubmission.receiptId);
+          if (priorReceipt === undefined) {
+            throw new Error(
+              `submission ${priorSubmission.submissionId} references missing receipt ${priorSubmission.receiptId}`
+            );
+          }
+          return priorReceipt;
+        }
+      }
+
+      let observedPayload: ObservedPayload | undefined;
+      let decoded: DecodedSemanticLayerTransition | undefined;
+      let registered: RegisteredSemanticLayer | undefined;
+      try {
+        const payloadHex = input.payloadHex ?? scalarHexToPayloadHex(input.dataScalars ?? []);
+        const payloadBytes = hexToBytes(payloadHex, 'payloadHex');
+        observedPayload = {
+          payloadHex: bytesToHex(payloadBytes),
+          payloadHash: `0x${createHash('sha256').update(payloadBytes).digest('hex')}`,
+          payloadSize: payloadBytes.byteLength
+        };
+        decoded = decodeSemanticLayerTransition(observedPayload.payloadHex);
+        registered = this.resolveRegistration(input, decoded);
+
+        if (
+          input.payloadHash !== undefined &&
+          normalizeHash(input.payloadHash) !== decoded.payloadHash
+        ) {
+          throw new Error(
+            `payload hash mismatch: expected ${input.payloadHash}, decoded ${decoded.payloadHash}`
+          );
+        }
+        if (input.payloadSize !== undefined && input.payloadSize !== decoded.payloadSize) {
+          throw new Error(
+            `payload size mismatch: expected ${input.payloadSize}, decoded ${decoded.payloadSize}`
+          );
+        }
+        if (
+          registered.registration.legacySlId !== undefined &&
+          stripHex(decoded.slId) !== stripHex(registered.registration.legacySlId)
+        ) {
+          throw new Error(
+            `legacy slId mismatch: expected ${registered.registration.legacySlId}, got ${decoded.slId}`
+          );
+        }
+
+        const acceptedReceipt = this.repository.getAcceptedReceipt({
+          semanticLayerAddress: registered.registration.semanticLayerAddress,
+          registrationHash: registered.registrationHash,
+          payloadHash: decoded.payloadHash
+        });
+        if (acceptedReceipt !== undefined) {
+          this.repository.savePayload(observedPayload);
+          this.saveSubmission({
+            input,
+            timestamp,
+            requestFingerprint,
+            registration: registered,
+            payloadHash: decoded.payloadHash,
+            receipt: acceptedReceipt
+          });
+          return acceptedReceipt;
+        }
+
+        const expectedSequence = registered.sequence + 1;
+        if (Number(decoded.sequence) !== expectedSequence) {
+          throw new Error(
+            `sequence mismatch: expected ${expectedSequence}, got ${decoded.sequence.toString()}`
+          );
+        }
+        if (normalizeHash(decoded.prevStateHash) !== normalizeHash(registered.stateRoot)) {
+          throw new Error(
+            `prevStateHash mismatch: expected ${registered.stateRoot}, got ${decoded.prevStateHash}`
+          );
+        }
+
+        const receipt = this.buildReceipt({
+          input,
+          registration: registered,
+          decoded,
+          timestamp,
+          payloadHash: decoded.payloadHash,
+          payloadSize: decoded.payloadSize,
+          sequence: Number(decoded.sequence),
+          verdict: 'accepted',
+          stateRootBefore: registered.stateRoot,
+          stateRootAfter: decoded.newStateHash
+        });
+        if (
+          receipt.checkpointId === undefined ||
+          receipt.registrationHash === undefined ||
+          receipt.stateRootAfter === undefined
+        ) {
+          throw new Error('accepted receipt is missing checkpoint state');
+        }
+
+        this.repository.savePayload(observedPayload);
+        this.repository.saveReceipt(receipt);
+        this.saveSubmission({
+          input,
+          timestamp,
+          requestFingerprint,
+          registration: registered,
+          payloadHash: decoded.payloadHash,
+          receipt
+        });
+        this.repository.saveCheckpoint({
+          checkpointId: receipt.checkpointId,
+          semanticLayerAddress: receipt.semanticLayerAddress,
+          registrationHash: receipt.registrationHash,
+          sequence: receipt.sequence,
+          payloadHash: receipt.payloadHash,
+          stateRootBefore: receipt.stateRootBefore,
+          stateRootAfter: receipt.stateRootAfter,
+          receiptId: receipt.receiptId,
+          previousCheckpointId: registered.checkpointId,
+          timestamp: receipt.timestamp
+        });
+        this.repository.updateAcceptedHead({
+          semanticLayerAddress: registered.registration.semanticLayerAddress,
+          expectedRegistrationHash: registered.registrationHash,
+          expectedSequence: registered.sequence,
+          expectedStateRoot: registered.stateRoot,
+          expectedCheckpointId: registered.checkpointId,
+          sequence: Number(decoded.sequence),
+          stateRoot: decoded.newStateHash,
+          checkpointId: receipt.checkpointId
+        });
+        return receipt;
+      } catch (error) {
+        if (
+          error instanceof ReferenceVerifierIdempotencyConflictError ||
+          error instanceof ReferenceVerifierRepositoryConflictError
+        ) {
+          throw error;
+        }
+        const fallbackRegistration =
+          registered ?? this.rejectionRegistration(input, decoded, timestamp);
+        const payloadHash =
+          observedPayload?.payloadHash ??
+          safeNormalizedHash(input.payloadHash) ??
+          digestHex(
+            `iovi.reference-verifier.unparsed-input.v1\n${requestFingerprint}`
+          );
+        const receipt = this.buildReceipt({
+          input,
+          registration: fallbackRegistration,
+          decoded,
+          timestamp,
+          payloadHash,
+          payloadSize: observedPayload?.payloadSize ?? input.payloadSize,
+          sequence: Number(
+            decoded?.sequence ?? BigInt(fallbackRegistration.sequence + 1)
+          ),
+          verdict: 'rejected',
+          reason: error instanceof Error ? error.message : String(error),
+          stateRootBefore: fallbackRegistration.stateRoot,
+          stateRootAfter: fallbackRegistration.stateRoot
+        });
+        if (observedPayload !== undefined) this.repository.savePayload(observedPayload);
+        this.repository.saveReceipt(receipt);
+        this.saveSubmission({
+          input,
+          timestamp,
+          requestFingerprint,
+          registration: fallbackRegistration,
+          payloadHash,
+          receipt
+        });
+        return receipt;
+      }
+    });
   }
 
   verifyUtxos(
@@ -599,6 +810,7 @@ export class IoviReferenceVerifier {
           semanticLayerAddress: utxo.semanticLayerAddress,
           dataScalars: utxo.data,
           postingId: utxo.id,
+          idempotencyKey: `utxo:${utxo.id}`,
           txHash: utxo.txHash,
           metadata: {
             source: 'utxo',
@@ -615,29 +827,43 @@ export class IoviReferenceVerifier {
     if (input.semanticLayerAddress !== undefined) {
       return this.requireRegisteredSemanticLayer(input.semanticLayerAddress);
     }
-    const legacyAddress = this.legacySlIdIndex.get(stripHex(decoded.slId));
-    if (legacyAddress !== undefined) return this.requireRegisteredSemanticLayer(legacyAddress);
-    if (this.registrations.size === 1) {
-      const only = [...this.registrations.values()][0];
-      if (only.registration.legacySlId === undefined || stripHex(only.registration.legacySlId) === stripHex(decoded.slId)) {
+    const legacy = this.repository.getSemanticLayerByLegacySlId(stripHex(decoded.slId));
+    if (legacy !== undefined) return legacy;
+    const registrations = this.repository.listSemanticLayers();
+    if (registrations.length === 1) {
+      const only = registrations[0];
+      if (
+        only.registration.legacySlId === undefined ||
+        stripHex(only.registration.legacySlId) === stripHex(decoded.slId)
+      ) {
         return only;
       }
     }
     throw new Error(`semantic layer is not registered for payload slId ${decoded.slId}`);
   }
 
-  private requireRegisteredSemanticLayer(semanticLayerAddress: string): RegisteredSemanticLayer {
-    const registered = this.registrations.get(normalizeSemanticLayerAddress(semanticLayerAddress));
-    if (!registered) throw new Error(`semantic layer ${semanticLayerAddress} is not registered`);
+  private requireRegisteredSemanticLayer(
+    semanticLayerAddress: string
+  ): RegisteredSemanticLayer {
+    const registered = this.repository.getSemanticLayer(
+      normalizeSemanticLayerAddress(semanticLayerAddress)
+    );
+    if (registered === undefined) {
+      throw new Error(`semantic layer ${semanticLayerAddress} is not registered`);
+    }
     return registered;
   }
 
   private rejectionRegistration(
     input: ReferenceVerifierPayloadInput,
-    decoded: DecodedSemanticLayerTransition | undefined
+    decoded: DecodedSemanticLayerTransition | undefined,
+    timestamp: string
   ): RegisteredSemanticLayer {
     const semanticLayerAddress = normalizeSemanticLayerAddress(
-      input.semanticLayerAddress ?? (decoded === undefined ? 'unregistered:unknown' : `unregistered-sl:${stripHex(decoded.slId)}`)
+      input.semanticLayerAddress ??
+        (decoded === undefined
+          ? 'unregistered:unknown'
+          : `unregistered-sl:${stripHex(decoded.slId)}`)
     );
     return {
       registration: buildSemanticLayerRegistration({
@@ -650,7 +876,7 @@ export class IoviReferenceVerifier {
       registrationHash: ZERO_HASH,
       sequence: 0,
       stateRoot: ZERO_HASH,
-      receipts: []
+      registeredAt: timestamp
     };
   }
 
@@ -661,8 +887,39 @@ export class IoviReferenceVerifier {
       registrationHash: registered.registrationHash,
       sequence: registered.sequence,
       stateRoot: registered.stateRoot,
-      checkpointId: registered.receipts.at(-1)?.checkpointId
+      checkpointId: registered.checkpointId
     };
+  }
+
+  private saveSubmission(input: {
+    input: ReferenceVerifierPayloadInput;
+    timestamp: string;
+    requestFingerprint: string;
+    registration: RegisteredSemanticLayer;
+    payloadHash: string;
+    receipt: VerifierReceiptV1;
+  }): void {
+    const submissionId = digestHex(
+      `iovi.reference-verifier.submission.v1\n${canonicalJson({
+        verifierId: this.verifierId,
+        idempotencyKey: input.input.idempotencyKey,
+        requestFingerprint: input.requestFingerprint,
+        timestamp: input.timestamp,
+        receiptId: input.receipt.receiptId
+      })}`
+    );
+    this.repository.saveSubmission({
+      submissionId,
+      idempotencyKey: input.input.idempotencyKey,
+      requestFingerprint: input.requestFingerprint,
+      semanticLayerAddress: input.registration.registration.semanticLayerAddress,
+      payloadHash: normalizeHash(input.payloadHash),
+      postingId: input.input.postingId,
+      txHash: input.input.txHash,
+      metadata: input.input.metadata,
+      timestamp: input.timestamp,
+      receiptId: input.receipt.receiptId
+    });
   }
 
   private buildReceipt(input: {
@@ -679,7 +936,7 @@ export class IoviReferenceVerifier {
     stateRootAfter?: string;
   }): VerifierReceiptV1 {
     const registration = input.registration.registration;
-    const unsigned: Omit<VerifierReceiptV1, 'signature'> = {
+    const base: Omit<VerifierReceiptV1, 'receiptId' | 'signature'> = {
       receiptVersion: CONTRACT_VERSION_V1,
       receiptFormat: VERIFIER_RECEIPT_V1_FORMAT,
       semanticLayerAddress: registration.semanticLayerAddress,
@@ -687,21 +944,43 @@ export class IoviReferenceVerifier {
       sequence: input.sequence,
       verdict: input.verdict,
       stateRootBefore: normalizeHash(input.stateRootBefore),
-      checkpointId: checkpointId(registration.semanticLayerAddress, input.sequence, input.payloadHash, input.verdict),
       verifierId: this.verifierId,
       timestamp: input.timestamp
     };
-    if (input.registration.registrationHash !== ZERO_HASH) unsigned.registrationHash = input.registration.registrationHash;
-    unsigned.slId = input.decoded?.slId ?? registration.legacySlId;
-    if (registration.manifestHash !== undefined) unsigned.manifestHash = registration.manifestHash;
-    if (input.payloadSize !== undefined) unsigned.payloadSize = input.payloadSize;
-    if (input.input.postingId !== undefined) unsigned.postingId = input.input.postingId;
-    if (input.input.txHash !== undefined) unsigned.txHash = input.input.txHash;
-    if (input.reason !== undefined) unsigned.reason = input.reason;
-    if (input.stateRootAfter !== undefined) unsigned.stateRootAfter = normalizeHash(input.stateRootAfter);
-    if (input.input.metadata !== undefined) unsigned.metadata = input.input.metadata;
+    if (input.registration.registrationHash !== ZERO_HASH) {
+      base.registrationHash = input.registration.registrationHash;
+    }
+    base.slId = input.decoded?.slId ?? registration.legacySlId;
+    if (registration.manifestHash !== undefined) base.manifestHash = registration.manifestHash;
+    if (input.payloadSize !== undefined) base.payloadSize = input.payloadSize;
+    if (input.input.postingId !== undefined) base.postingId = input.input.postingId;
+    if (input.input.txHash !== undefined) base.txHash = input.input.txHash;
+    if (input.reason !== undefined) base.reason = input.reason;
+    if (input.stateRootAfter !== undefined) {
+      base.stateRootAfter = normalizeHash(input.stateRootAfter);
+    }
+    if (input.input.metadata !== undefined) base.metadata = input.input.metadata;
+    if (input.verdict === 'accepted') {
+      if (base.registrationHash === undefined || base.stateRootAfter === undefined) {
+        throw new Error('accepted receipt requires registration and next state roots');
+      }
+      base.checkpointId = acceptedCheckpointId({
+        verifierId: this.verifierId,
+        semanticLayerAddress: registration.semanticLayerAddress,
+        registrationHash: base.registrationHash,
+        sequence: input.sequence,
+        payloadHash: base.payloadHash,
+        stateRootBefore: base.stateRootBefore,
+        stateRootAfter: base.stateRootAfter
+      });
+    }
 
-    const receipt = {
+    const receiptId = referenceReceiptId(base);
+    const unsigned: Omit<VerifierReceiptV1, 'signature'> = {
+      ...base,
+      receiptId
+    };
+    const receipt: VerifierReceiptV1 = {
       ...unsigned,
       signature: referenceSignature(unsigned)
     };
@@ -716,7 +995,17 @@ export async function startReferenceVerifierServer(
 ): Promise<ReferenceVerifierServer> {
   const server = createServer((request, response) => {
     handleVerifierRequest(verifier, request, response).catch((error) => {
-      writeJson(response, 500, { error: error instanceof Error ? error.message : String(error) });
+      const conflict =
+        error instanceof ReferenceVerifierIdempotencyConflictError ||
+        error instanceof ReferenceVerifierRepositoryConflictError;
+      writeJson(response, conflict ? 409 : 500, {
+        error: error instanceof Error ? error.message : String(error),
+        code:
+          error instanceof ReferenceVerifierIdempotencyConflictError ||
+          error instanceof ReferenceVerifierRepositoryConflictError
+            ? error.code
+            : 'VERIFIER_INTERNAL_ERROR'
+      });
     });
   });
   const host = options.host ?? '127.0.0.1';
@@ -824,6 +1113,16 @@ async function handleVerifierRequest(
     writeJson(response, 200, { receipts: verifier.listReceipts({ semanticLayerAddress }) });
     return;
   }
+  if (request.method === 'GET' && url.pathname.startsWith('/receipts/by-id/')) {
+    const receiptId = decodeURIComponent(url.pathname.slice('/receipts/by-id/'.length));
+    const receipt = verifier.getReceiptById(receiptId);
+    if (!receipt) {
+      writeJson(response, 404, { error: 'receipt not found' });
+      return;
+    }
+    writeJson(response, 200, receipt);
+    return;
+  }
   if (request.method === 'GET' && url.pathname.startsWith('/receipts/')) {
     const payloadHash = decodeURIComponent(url.pathname.slice('/receipts/'.length));
     const receipt = verifier.getReceipt(payloadHash);
@@ -832,6 +1131,13 @@ async function handleVerifierRequest(
       return;
     }
     writeJson(response, 200, receipt);
+    return;
+  }
+  if (request.method === 'GET' && url.pathname === '/submissions') {
+    const semanticLayerAddress = url.searchParams.get('semanticLayerAddress') ?? undefined;
+    writeJson(response, 200, {
+      submissions: verifier.listSubmissions({ semanticLayerAddress })
+    });
     return;
   }
   if (request.method === 'POST' && url.pathname === '/verify') {
@@ -858,12 +1164,46 @@ function writeJson(response: ServerResponse, statusCode: number, body: unknown):
   response.end(JSON.stringify(body));
 }
 
-function checkpointId(slId: string, sequence: number, payloadHash: string, verdict: string): string {
-  return digestHex(`${stripHex(slId)}:${sequence}:${payloadHash}:${verdict}`);
+function acceptedCheckpointId(input: {
+  verifierId: string;
+  semanticLayerAddress: string;
+  registrationHash: string;
+  sequence: number;
+  payloadHash: string;
+  stateRootBefore: string;
+  stateRootAfter: string;
+}): string {
+  return digestHex(
+    `iovi.reference-verifier.accepted-checkpoint.v1\n${canonicalJson(input)}`
+  );
+}
+
+function referenceReceiptId(
+  unsigned: Omit<VerifierReceiptV1, 'receiptId' | 'signature'>
+): string {
+  return digestHex(
+    `iovi.reference-verifier.receipt-id.v1\n${canonicalJson(unsigned)}`
+  );
 }
 
 function referenceSignature(unsigned: Omit<VerifierReceiptV1, 'signature'>): string {
   return digestHex(`iovi-reference-verifier-v1:${canonicalJson(unsigned)}`);
+}
+
+function verifierRequestFingerprint(input: ReferenceVerifierPayloadInput): string {
+  const { idempotencyKey: _idempotencyKey, ...request } = input;
+  return digestHex(
+    `iovi.reference-verifier.request.v1\n${canonicalJson(request)}`
+  );
+}
+
+function safeNormalizedHash(value: string | undefined): string | undefined {
+  if (value === undefined) return undefined;
+  try {
+    return normalizeHash(value);
+  } catch {
+    return undefined;
+  }
 }
 
 function assertSupportedReferenceRegistration(registration: SemanticLayerRegistrationV1): void {
