@@ -18,6 +18,12 @@ The receipt ID commits the complete unsigned decision, excluding only `receiptId
 
 `ReferenceVerifierPayloadInput.idempotencyKey` is optional. Reusing a key with the same request fingerprint returns the original receipt. Reusing it with different input is an idempotency conflict and does not create a verifier receipt.
 
+The public read contract returns a content-addressed `StoredPayloadV1` by
+`payloadHash` and an accepted `StoredCheckpointV1` by `checkpointId`. Reads expose
+the exact committed records and never trigger verification, external retrieval,
+polling, or semantic projection. Unknown well-formed identifiers return HTTP `404`
+with the stable code `VERIFIER_RECORD_NOT_FOUND`.
+
 ## Required Behavior
 
 | Situation | Required result |

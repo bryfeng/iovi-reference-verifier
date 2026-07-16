@@ -207,8 +207,16 @@ Routes:
 | `GET` | `/receipts` | Read all receipts |
 | `GET` | `/receipts/:payloadHash` | Read one receipt by payload hash |
 | `GET` | `/receipts/by-id/:receiptId` | Read one receipt by receipt ID |
+| `GET` | `/payloads/:payloadHash` | Read exact stored opaque payload bytes by hash |
+| `GET` | `/checkpoints/latest` | Read latest accepted state heads |
+| `GET` | `/checkpoints/by-id/:checkpointId` | Read one accepted checkpoint by checkpoint ID |
 | `GET` | `/submissions` | Read persisted submission and retry references |
 | `POST` | `/verify` | Verify a payload or EON data scalars |
+
+Payload and checkpoint reads return the exact generic records already committed by
+verification. A missing identifier returns HTTP `404` with code
+`VERIFIER_RECORD_NOT_FOUND`. These routes do not re-run verification, resolve
+external evidence, poll a base layer, or construct semantic projections.
 
 `POST /verify` accepts either `payloadHex` or `dataScalars`:
 

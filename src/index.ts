@@ -5,6 +5,8 @@ import {
   InMemoryReferenceVerifierRepository,
   ReferenceVerifierRepositoryConflictError,
   type ReferenceVerifierRepository,
+  type StoredCheckpointV1,
+  type StoredPayloadV1,
   type StoredSemanticLayerV1,
   type StoredSubmissionV1
 } from './repository.js';
@@ -27,6 +29,7 @@ export const SEMANTIC_LAYER_MANIFEST_V1_FORMAT = 'iovi-semantic-layer-manifest-v
 export const SEMANTIC_LAYER_REGISTRATION_V1_FORMAT = 'iovi-semantic-layer-registration-v1';
 export const VERIFIER_RECEIPT_V1_FORMAT = 'iovi-verifier-receipt-v1';
 export const CONTRACT_VERSION_V1 = '1.0.0';
+export const VERIFIER_RECORD_NOT_FOUND_CODE = 'VERIFIER_RECORD_NOT_FOUND';
 export const ZERO_HASH = `0x${'00'.repeat(32)}`;
 
 const SCALAR_BYTES = 4;
@@ -601,6 +604,14 @@ export class IoviReferenceVerifier {
     return this.repository.getReceiptById(normalizeHash(receiptId));
   }
 
+  getPayload(payloadHash: string): StoredPayloadV1 | undefined {
+    return this.repository.getPayload(normalizeHash(payloadHash));
+  }
+
+  getCheckpoint(checkpointId: string): StoredCheckpointV1 | undefined {
+    return this.repository.getCheckpoint(normalizeHash(checkpointId));
+  }
+
   verifyPayload(input: ReferenceVerifierPayloadInput): VerifierReceiptV1 {
     assertNoPrivateMaterial(input);
     if (input.idempotencyKey !== undefined) {
@@ -1106,6 +1117,32 @@ async function handleVerifierRequest(
       200,
       semanticLayerAddress === null ? { states: verifier.listStates() } : verifier.getState(semanticLayerAddress)
     );
+    return;
+  }
+  if (request.method === 'GET' && url.pathname.startsWith('/checkpoints/by-id/')) {
+    const checkpointId = decodeURIComponent(url.pathname.slice('/checkpoints/by-id/'.length));
+    const checkpoint = verifier.getCheckpoint(checkpointId);
+    if (!checkpoint) {
+      writeJson(response, 404, {
+        error: 'checkpoint not found',
+        code: VERIFIER_RECORD_NOT_FOUND_CODE
+      });
+      return;
+    }
+    writeJson(response, 200, checkpoint);
+    return;
+  }
+  if (request.method === 'GET' && url.pathname.startsWith('/payloads/')) {
+    const payloadHash = decodeURIComponent(url.pathname.slice('/payloads/'.length));
+    const payload = verifier.getPayload(payloadHash);
+    if (!payload) {
+      writeJson(response, 404, {
+        error: 'payload not found',
+        code: VERIFIER_RECORD_NOT_FOUND_CODE
+      });
+      return;
+    }
+    writeJson(response, 200, payload);
     return;
   }
   if (request.method === 'GET' && url.pathname === '/receipts') {

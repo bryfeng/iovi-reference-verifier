@@ -9,7 +9,8 @@ import { encodeSemanticLayerTransition } from '@bryaniovi/sldk';
 import {
   IoviReferenceVerifier,
   ZERO_HASH,
-  buildSemanticLayerRegistration
+  buildSemanticLayerRegistration,
+  startReferenceVerifierServer
 } from '../dist/index.js';
 import {
   REFERENCE_VERIFIER_SQLITE_SCHEMA_VERSION,
@@ -43,6 +44,12 @@ test('SQLite restores registration, accepted head, receipts, submissions, and pa
       timestamp: '2026-07-12T00:00:01.000Z'
     });
     const stateBeforeClose = firstVerifier.getState(LAYER_ADDRESS);
+    const recordsBeforeClose = await readStoredHttpRecords(
+      firstVerifier,
+      payload.payloadHash,
+      accepted.checkpointId
+    );
+    assert.deepEqual(firstVerifier.getState(LAYER_ADDRESS), stateBeforeClose);
     firstVerifier.close();
 
     const secondRepository = new SqliteReferenceVerifierRepository(databasePath);
@@ -52,6 +59,10 @@ test('SQLite restores registration, accepted head, receipts, submissions, and pa
     });
     assert.deepEqual(secondVerifier.getState(LAYER_ADDRESS), stateBeforeClose);
     assert.deepEqual(secondVerifier.getReceiptById(accepted.receiptId), accepted);
+    assert.deepEqual(
+      await readStoredHttpRecords(secondVerifier, payload.payloadHash, accepted.checkpointId),
+      recordsBeforeClose
+    );
     assert.deepEqual(secondRepository.getPayload(payload.payloadHash), {
       payloadHash: payload.payloadHash,
       payloadHex: payload.payloadHex,
@@ -107,6 +118,30 @@ test('SQLite restores registration, accepted head, receipts, submissions, and pa
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+async function readStoredHttpRecords(verifier, payloadHash, checkpointId) {
+  const server = await startReferenceVerifierServer(verifier);
+  try {
+    const payloadResponse = await fetch(
+      `${server.url}/payloads/${encodeURIComponent(payloadHash)}`
+    );
+    const checkpointResponse = await fetch(
+      `${server.url}/checkpoints/by-id/${encodeURIComponent(checkpointId)}`
+    );
+    return {
+      payload: {
+        status: payloadResponse.status,
+        body: await payloadResponse.text()
+      },
+      checkpoint: {
+        status: checkpointResponse.status,
+        body: await checkpointResponse.text()
+      }
+    };
+  } finally {
+    await server.close();
+  }
+}
 
 test('SQLite transactions roll back partial writes', () => {
   const repository = new SqliteReferenceVerifierRepository(':memory:');

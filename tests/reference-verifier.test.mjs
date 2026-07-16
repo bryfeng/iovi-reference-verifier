@@ -6,6 +6,7 @@ import {
   CONTRACT_VERSION_V1,
   IoviReferenceVerifier,
   SEMANTIC_LAYER_REGISTRATION_V1_FORMAT,
+  VERIFIER_RECORD_NOT_FOUND_CODE,
   VERIFIER_RECEIPT_V1_FORMAT,
   ZERO_HASH,
   buildSemanticLayerRegistration,
@@ -117,7 +118,7 @@ test('IoviReferenceVerifier can verify data-bearing UTXO rows through registered
   assert.equal(receipts[0].semanticLayerAddress, LAYER_A_ADDRESS);
 });
 
-test('reference verifier HTTP server exposes registration, state, receipts, and verify route', async () => {
+test('reference verifier HTTP server exposes neutral verification and stored-record reads', async () => {
   const verifier = new IoviReferenceVerifier();
   const server = await startReferenceVerifierServer(verifier);
   try {
@@ -157,6 +158,44 @@ test('reference verifier HTTP server exposes registration, state, receipts, and 
     );
     assert.equal(receiptIdResponse.status, 200);
     assert.equal((await receiptIdResponse.json()).receiptId, storedReceipt.receiptId);
+
+    const payloadResponse = await fetch(
+      `${server.url}/payloads/${encodeURIComponent(payload.payloadHash)}`
+    );
+    assert.equal(payloadResponse.status, 200);
+    assert.deepEqual(await payloadResponse.json(), {
+      payloadHash: payload.payloadHash,
+      payloadHex: payload.payloadHex,
+      payloadSize: payload.payloadSize
+    });
+
+    const checkpointResponse = await fetch(
+      `${server.url}/checkpoints/by-id/${encodeURIComponent(storedReceipt.checkpointId)}`
+    );
+    assert.equal(checkpointResponse.status, 200);
+    assert.deepEqual(await checkpointResponse.json(), {
+      checkpointId: storedReceipt.checkpointId,
+      semanticLayerAddress: LAYER_A_ADDRESS,
+      registrationHash: storedReceipt.registrationHash,
+      sequence: 1,
+      payloadHash: payload.payloadHash,
+      stateRootBefore: ZERO_HASH,
+      stateRootAfter: hash('55'),
+      receiptId: storedReceipt.receiptId,
+      timestamp: storedReceipt.timestamp
+    });
+
+    for (const [path, error] of [
+      [`/payloads/${encodeURIComponent(hash('fe'))}`, 'payload not found'],
+      [`/checkpoints/by-id/${encodeURIComponent(hash('fd'))}`, 'checkpoint not found']
+    ]) {
+      const missingResponse = await fetch(`${server.url}${path}`);
+      assert.equal(missingResponse.status, 404);
+      assert.deepEqual(await missingResponse.json(), {
+        error,
+        code: VERIFIER_RECORD_NOT_FOUND_CODE
+      });
+    }
 
     const submissionsResponse = await fetch(`${server.url}/submissions`);
     assert.equal(submissionsResponse.status, 200);
