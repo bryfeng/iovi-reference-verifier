@@ -2,8 +2,16 @@
   "name": "@bryaniovi/iovi-reference-verifier",
   "version": "0.1.0-alpha.0",
   "type": "module",
-  "private": true,
   "description": "Reference verifier platform for registered IOVI semantic layers and verifier receipts.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bryfeng/iovi-reference-verifier.git"
+  },
+  "publishConfig": {
+    "access": "restricted",
+    "registry": "https://registry.npmjs.org",
+    "tag": "alpha"
+  },
   "license": "MIT",
   "engines": {
     "node": ">=22.13"
@@ -29,7 +37,8 @@
     "build": "tsc -p tsconfig.json",
     "prepare": "npm run build",
     "test": "npm run build && node --test tests/*.test.mjs",
-    "check": "npm run test"
+    "check": "npm run test",
+    "pack:check": "npm pack --dry-run"
   },
   "devDependencies": {
     "@bryaniovi/sldk": "0.1.0-alpha.4",
