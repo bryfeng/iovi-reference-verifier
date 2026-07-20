@@ -2,15 +2,11 @@
   "name": "@bryaniovi/iovi-reference-verifier",
   "version": "0.1.0-alpha.0",
   "type": "module",
+  "private": true,
   "description": "Reference verifier platform for registered IOVI semantic layers and verifier receipts.",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/bryfeng/iovi-reference-verifier.git"
-  },
-  "publishConfig": {
-    "access": "restricted",
-    "registry": "https://registry.npmjs.org",
-    "tag": "alpha"
   },
   "license": "MIT",
   "engines": {
